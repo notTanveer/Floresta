@@ -4,10 +4,6 @@
 //! our transactions every 1 hour.
 //! Once our transaction is included in a block, we remove it from the mempool.
 
-use core::error::Error;
-use core::fmt;
-use core::fmt::Display;
-use core::fmt::Formatter;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -24,8 +20,9 @@ use bitcoin::Transaction;
 use bitcoin::TxMerkleNode;
 use bitcoin::Txid;
 use floresta_chain::pruned_utreexo::consensus::Consensus;
-use floresta_chain::BlockchainError;
 use tracing::debug;
+
+use crate::MempoolError;
 
 /// A short transaction id that we use to identify transactions in the mempool.
 ///
@@ -70,42 +67,6 @@ pub struct Mempool {
     hasher: ahash::RandomState,
 }
 
-#[derive(Debug)]
-/// An error returned when we try to add a transaction to the mempool.
-pub enum AcceptToMempoolError {
-    /// Memory usage is too high.
-    MemoryUsageTooHigh,
-
-    /// The transaction is conflicting with another transaction in the mempool.
-    ConflictingTransaction,
-
-    /// This transaction has duplicated inputs
-    DuplicatedInputs,
-
-    /// A validation error happened while consensus checking a transaction
-    // TODO(davidson): we might want to make an error type specific for consensus,
-    // instead of reusing BlockchainError.
-    Consensus(BlockchainError),
-}
-
-impl Display for AcceptToMempoolError {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
-        match self {
-            AcceptToMempoolError::MemoryUsageTooHigh => write!(f, "we are running out of memory"),
-            AcceptToMempoolError::ConflictingTransaction => {
-                write!(f, "we have another transaction that spends the same input")
-            }
-            AcceptToMempoolError::DuplicatedInputs => {
-                write!(f, "this transaction has duplicated inputs")
-            }
-            AcceptToMempoolError::Consensus(e) => {
-                write!(f, "the transaction failed consensus validation: {e}")
-            }
-        }
-    }
-}
-
-impl Error for AcceptToMempoolError {}
 
 impl Mempool {
     /// Creates a new mempool with a given maximum size
@@ -245,7 +206,7 @@ impl Mempool {
     }
 
     /// Checks if the transaction doesn't have conflicting inputs or spends the same input twice.
-    fn check_for_conflicts(&self, transaction: &Transaction) -> Result<(), AcceptToMempoolError> {
+    fn check_for_conflicts(&self, transaction: &Transaction) -> Result<(), MempoolError> {
         // check for duplicate inputs
         let inputs = transaction
             .input
@@ -254,14 +215,14 @@ impl Mempool {
             .collect::<BTreeSet<_>>();
 
         if inputs.len() != transaction.input.len() {
-            return Err(AcceptToMempoolError::DuplicatedInputs);
+            return Err(MempoolError::DuplicatedInputs);
         }
 
         // Check this transaction doesn't conflict with another transaction in the mempool
         // TODO(davidson): RBF
         for input in transaction.input.iter() {
             if self.is_already_spent(&input.previous_output) {
-                return Err(AcceptToMempoolError::ConflictingTransaction);
+                return Err(MempoolError::ConflictingTransaction);
             }
         }
 
@@ -275,17 +236,19 @@ impl Mempool {
     /// proof.
     ///
     /// # Errors
-    ///  - If we don't have space left in our mempool
-    ///  - If the transaction conflicts with another mempool transaction
-    ///  - If it sepends the same input twice
-    ///  - If any amount check fails: if input amounts are less than output amounts or if it spends more than
-    ///    the theoretical maximum amount of Bitcoins
-    ///  - If either vIn or vOut are empty
-    ///  - If any script is larger than the maximum allowed size
+    ///  - [`MempoolError::MemoryUsageTooHigh`] if we don't have space left in our mempool
+    ///  - [`MempoolError::AlreadyKnown`] if the transaction is already present in the mempool
+    ///  - [`MempoolError::Consensus`] if the transaction fails context-free consensus checks
+    ///  - [`MempoolError::ConflictingTransaction`] if the transaction conflicts with another mempool transaction
+    ///  - [`MempoolError::DuplicatedInputs`] if it spends the same input twice
+    ///  - [`MempoolError::FeeTooLow`] (stub — always passes for now)
+    ///  - [`MempoolError::ExceedsMaxWeight`] (stub — always passes for now)
+    ///  - [`MempoolError::NonStandard`] (stub — always passes for now)
+    ///  - [`MempoolError::ExceedsScriptSigSize`] (stub — always passes for now)
     pub fn accept_to_mempool(
         &mut self,
         transaction: Transaction,
-    ) -> Result<(), AcceptToMempoolError> {
+    ) -> Result<(), MempoolError> {
         debug!(
             "Accepting {} to mempool {:?}",
             transaction.compute_txid(),
@@ -295,19 +258,38 @@ impl Mempool {
         // Make sure our mempool has space
         let tx_size = transaction.total_size();
         if self.mempool_size + tx_size > self.max_mempool_size {
-            return Err(AcceptToMempoolError::MemoryUsageTooHigh);
+            return Err(MempoolError::MemoryUsageTooHigh);
         }
 
         let short_txid = self.hasher.hash_one(transaction.compute_txid());
 
         // Checks if we don't have this tx already
         if self.transactions.contains_key(&short_txid) {
-            return Ok(());
+            return Err(MempoolError::AlreadyKnown);
         }
+
+        // --- Policy stubs (no logic yet; each returns Ok(())) ---
+
+        // Stub: reject transactions whose fee rate is below the minimum.
+        // TODO: compute fee rate and compare against a configurable threshold.
+        Self::check_fee_rate(&transaction)?;
+
+        // Stub: reject transactions exceeding MAX_STANDARD_TX_WEIGHT.
+        // TODO: enforce bitcoin::policy::MAX_STANDARD_TX_WEIGHT.
+        Self::check_max_weight(&transaction)?;
+
+        // Stub: reject non-standard transactions (unknown script types, bare
+        // multisig, excessive output counts, …).
+        // TODO: implement standardness rules.
+        Self::check_standardness(&transaction)?;
+
+        // Stub: reject transactions whose scriptSigs exceed MAX_SCRIPT_SIG_SIZE.
+        // TODO: enforce per-input scriptSig size limit.
+        Self::check_script_sig_size(&transaction)?;
 
         // Perform context-free consensus checks
         Consensus::check_transaction_context_free(&transaction)
-            .map_err(AcceptToMempoolError::Consensus)?;
+            .map_err(MempoolError::Consensus)?;
 
         // Make sure transaction won't conflict with other mempool transaction
         self.check_for_conflicts(&transaction)?;
@@ -331,6 +313,30 @@ impl Mempool {
         );
         self.mempool_size += tx_size;
 
+        Ok(())
+    }
+
+    /// Stub: fee-rate check. Always passes until policy logic is added.
+    fn check_fee_rate(_transaction: &Transaction) -> Result<(), MempoolError> {
+        // TODO: enforce minimum fee rate policy.
+        Ok(())
+    }
+
+    /// Stub: weight check. Always passes until policy logic is added.
+    fn check_max_weight(_transaction: &Transaction) -> Result<(), MempoolError> {
+        // TODO: enforce MAX_STANDARD_TX_WEIGHT.
+        Ok(())
+    }
+
+    /// Stub: standardness check. Always passes until policy logic is added.
+    fn check_standardness(_transaction: &Transaction) -> Result<(), MempoolError> {
+        // TODO: implement standardness rules.
+        Ok(())
+    }
+
+    /// Stub: scriptSig size check. Always passes until policy logic is added.
+    fn check_script_sig_size(_transaction: &Transaction) -> Result<(), MempoolError> {
+        // TODO: enforce MAX_SCRIPT_SIG_SIZE per input.
         Ok(())
     }
 
@@ -388,7 +394,7 @@ mod tests {
     use rand::SeedableRng;
 
     use super::Mempool;
-    use crate::mempool::AcceptToMempoolError;
+    use crate::MempoolError;
 
     /// builds a list of transactions in a pseudo-random way
     ///
@@ -502,7 +508,7 @@ mod tests {
         for tx in transactions {
             match mempool.accept_to_mempool(tx) {
                 Ok(_) => {}
-                Err(AcceptToMempoolError::DuplicatedInputs) => {
+                Err(MempoolError::DuplicatedInputs) => {
                     did_conflict = true;
                 }
 
@@ -621,5 +627,177 @@ mod tests {
         assert!(block.check_merkle_root());
 
         check_block_transactions(block);
+    }
+
+    // -----------------------------------------------------------------------
+    // MempoolError variant reachability tests
+    // -----------------------------------------------------------------------
+
+    /// Helper that builds a minimal valid (non-coinbase) transaction.
+    fn make_tx(previous_output: OutPoint) -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: absolute::LockTime::from_consensus(0),
+            input: vec![bitcoin::TxIn {
+                previous_output,
+                script_sig: bitcoin::Script::new().into(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: bitcoin::Script::new().into(),
+            }],
+        }
+    }
+
+    #[test]
+    fn error_already_known() {
+        let mut mempool = Mempool::new(10_000_000);
+        let tx = make_tx(OutPoint {
+            txid: Txid::all_zeros(),
+            vout: 0,
+        });
+
+        mempool.accept_to_mempool(tx.clone()).unwrap();
+
+        let err = mempool
+            .accept_to_mempool(tx)
+            .expect_err("expected AlreadyKnown");
+        assert!(
+            matches!(err, MempoolError::AlreadyKnown),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    #[test]
+    fn error_memory_usage_too_high() {
+        // Mempool with zero bytes of budget — any transaction must be rejected.
+        let mut mempool = Mempool::new(0);
+        let tx = make_tx(OutPoint {
+            txid: Txid::all_zeros(),
+            vout: 0,
+        });
+
+        let err = mempool
+            .accept_to_mempool(tx)
+            .expect_err("expected MemoryUsageTooHigh");
+        assert!(
+            matches!(err, MempoolError::MemoryUsageTooHigh),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    #[test]
+    fn error_duplicated_inputs() {
+        let mut mempool = Mempool::new(10_000_000);
+
+        // Build a transaction that spends the same outpoint twice.
+        let outpoint = OutPoint {
+            txid: Txid::all_zeros(),
+            vout: 0,
+        };
+        let tx = Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: absolute::LockTime::from_consensus(0),
+            input: vec![
+                bitcoin::TxIn {
+                    previous_output: outpoint,
+                    script_sig: bitcoin::Script::new().into(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
+                bitcoin::TxIn {
+                    previous_output: outpoint, // same outpoint → duplicate
+                    script_sig: bitcoin::Script::new().into(),
+                    sequence: Sequence::MAX,
+                    witness: Witness::new(),
+                },
+            ],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(1_000),
+                script_pubkey: bitcoin::Script::new().into(),
+            }],
+        };
+
+        let err = mempool
+            .accept_to_mempool(tx)
+            .expect_err("expected DuplicatedInputs");
+        assert!(
+            matches!(err, MempoolError::DuplicatedInputs),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    #[test]
+    fn error_conflicting_transaction() {
+        let mut mempool = Mempool::new(10_000_000);
+
+        // Parent tx spending the dummy input — this puts a real tx into the mempool
+        // so that its outputs can be tracked as "spendable".
+        let parent = make_tx(OutPoint {
+            txid: Txid::all_zeros(),
+            vout: 0,
+        });
+        let parent_txid = parent.compute_txid();
+        mempool.accept_to_mempool(parent).unwrap();
+
+        // Both tx1 and tx2 spend the first output of the parent.
+        let contested = OutPoint {
+            txid: parent_txid,
+            vout: 0,
+        };
+
+        // tx1 accepted fine.
+        let tx1 = make_tx(contested);
+        mempool.accept_to_mempool(tx1).unwrap();
+
+        // tx2 has different outputs (different txid) but spends the same contested output.
+        let tx2 = Transaction {
+            version: bitcoin::transaction::Version::ONE,
+            lock_time: absolute::LockTime::from_consensus(0),
+            input: vec![bitcoin::TxIn {
+                previous_output: contested,
+                script_sig: bitcoin::Script::new().into(),
+                sequence: Sequence::MAX,
+                witness: Witness::new(),
+            }],
+            output: vec![bitcoin::TxOut {
+                value: bitcoin::Amount::from_sat(2_000), // different value → different txid
+                script_pubkey: bitcoin::Script::new().into(),
+            }],
+        };
+
+        let err = mempool
+            .accept_to_mempool(tx2)
+            .expect_err("expected ConflictingTransaction");
+        assert!(
+            matches!(err, MempoolError::ConflictingTransaction),
+            "wrong variant: {err:?}"
+        );
+    }
+
+    /// The four policy stubs must currently return Ok(()) (no logic yet).
+    #[test]
+    fn stub_policy_checks_pass() {
+        let tx = make_tx(OutPoint {
+            txid: Txid::all_zeros(),
+            vout: 0,
+        });
+
+        assert!(Mempool::check_fee_rate(&tx).is_ok());
+        assert!(Mempool::check_max_weight(&tx).is_ok());
+        assert!(Mempool::check_standardness(&tx).is_ok());
+        assert!(Mempool::check_script_sig_size(&tx).is_ok());
+    }
+
+    /// Verify that the four policy-stub error variants exist and are constructible,
+    /// proving each is reachable once the stubs are wired up with real logic.
+    #[test]
+    fn stub_error_variants_are_constructible() {
+        let _fee = MempoolError::FeeTooLow;
+        let _weight = MempoolError::ExceedsMaxWeight;
+        let _std = MempoolError::NonStandard;
+        let _sig = MempoolError::ExceedsScriptSigSize;
     }
 }
